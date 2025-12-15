@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Task Tracker Pro - Collaborative</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const { 
+      Trash2, Plus, ChevronRight, ChevronDown, GripVertical, 
+      Calendar, Tag, Search, Undo2, Redo2, Download, Upload, 
+      Copy, CheckSquare, Wifi, WifiOff, Users 
+    } = lucide;
+
+    function TaskTracker() {
+      const [workspaceId, setWorkspaceId] = useState('default-workspace');
+      const [userId, setUserId] = useState(`user-${Date.now()}`);
+      const [userName, setUserName] = useState('Anonymous');
+      const [isConnected, setIsConnected] = useState(false);
+      const [connectedUsers, setConnectedUsers] = useState({});
+      const [lastUpdate, setLastUpdate] = useState(null);
+      const isRemoteUpdate = useRef(false);
+      const syncTimeout = useRef(null);
+      const unsubscribeWorkspace = useRef(null);
+      const unsubscribePresence = useRef(null);
+
+      const [tasks, setTasks] = useState([]);
+      const [input, setInput] = useState('');
+      const [expandedTasks, setExpandedTasks] = useState(new Set());
+      const [draggedTask, setDraggedTask] = useState(null);
+      const [dragOverTarget, setDragOverTarget] = useState(null);
+      const [history, setHistory] = useState([]);
+      const [historyIndex, setHistoryIndex] = useState(-1);
+      const [searchQuery, setSearchQuery] = useState('');
+      const [filterStatus, setFilterStatus] = useState('all');
+      const [selectedTasks, setSelectedTasks] = useState(new Set());
+      const [showBulkActions, setShowBulkActions] = useState(false);
+      const [showCompletedOnly, setShowCompletedOnly] = useState(false);
+      const [showWorkspaceModal, setShowWorkspaceModal] = useState(true);
+
+      useEffect(() => {
+        if (!workspaceId) return;
+
+        const setupFirebase = async () => {
+          try {
+            const { initializeApp } = await import('https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js');
+            const { getFirestore, doc, onSnapshot, setDoc, serverTimestamp } = await import('https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js');
+
+            const firebaseConfig = {
+              apiKey: "AIzaSyDYlsuCNurWgv-puH2ojM6wsARz6MLhwX4",
+              authDomain: "tasktracker-global.firebaseapp.com",
+              projectId: "tasktracker-global",
+              storageBucket: "tasktracker-global.firebasestorage.app",
+              messagingSenderId: "971419538942",
+              appId: "1:971419538942:web:3c91a74eae9f892aa99caf",
+              measurementId: "G-8ZHNKNPSBN"
+            };
+
+            const app = initializeApp(firebaseConfig);
+            const db = getFirestore(app);
+
+            const workspaceRef = doc(db, 'workspaces', workspaceId);
+            const presenceRef = doc(db, 'presence', workspaceId);
+
+            unsubscribeWorkspace.current = onSnapshot(workspaceRef, (snapshot) => {
+              if (snapshot.exists()) {
+                const data = snapshot.data();
+                
+                if (data.updatedBy !== userId || isRemoteUpdate.current) {
+                  isRemoteUpdate.current = true;
+                  
+                  if (tasks.length > 0) {
+                    addToHistory(tasks);
+                  }
+                  
+                  setTasks(data.tasks || []);
+                  setLastUpdate({
+                    by: data.updatedBy,
+                    at: data.updatedAt?.toDate?.() || new Date()
+                  });
+                  
+                  setTimeout(() => {
+                    isRemoteUpdate.current = false;
+                  }, 100);
+                }
+                
+                setIsConnected(true);
+              } else {
+                loadFromStorage();
+              }
+            }, (error) => {
+              console.error('Firestore connection error:', error);
+              setIsConnected(false);
+              loadFromStorage();
+            });
+
+            unsubscribePresence.current = onSnapshot(presenceRef, (snapshot) => {
+              if (snapshot.exists()) {
+                setConnectedUsers(snapshot.data() || {});
+              }
+            });
+
+            const updatePresence = async () => {
+              await setDoc(presenceRef, {
+                [userId]: {
+                  name: userName,
+                  lastSeen: serverTimestamp()
+                }
+              }, { merge: true });
+            };
+
+            updatePresence();
+            const presenceInterval = setInterval(updatePresence, 30000);
+
+            return () => {
+              clearInterval(presenceInterval);
+            };
+
+          } catch (error) {
+            console.error('Failed to initialize Firebase:', error);
+            setIsConnected(false);
+            loadFromStorage();
+          }
+        };
+
+        setupFirebase();
+
+        return () => {
+          if (unsubscribeWorkspace.current) unsubscribeWorkspace.current();
+          if (unsubscribePresence.current) unsubscribePresence.current();
+        };
+      }, [workspaceId, userId, userName]);
+
+      const loadFromStorage = () => {
+        try {
+          const saved = localStorage.getItem('tasks-data');
+          if (saved) {
+            const data = JSON.parse(saved);
+            setTasks(data.tasks || []);
+            setExpandedTasks(new Set(data.expandedTasks || []));
+          }
+        } catch (error) {
+          console.log('Starting fresh');
+        }
+      };
+
+      useEffect(() => {
+        if (isRemoteUpdate.current || !isConnected || !workspaceId) return;
+
+        if (syncTimeout.current) {
+          clearTimeout(syncTimeout.current);
+        }
+
+        syncTimeout.current = setTimeout(async () => {
+          try {
+            const { getFirestore, doc, setDoc, serverTimestamp } = await import('https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js');
+            const { getApps } = await import('https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js');
+            
+            let db;
+            if (getApps().length > 0) {
+              db = getFirestore();
+            } else {
+              return;
+            }
+
+            const workspaceRef = doc(db, 'workspaces', workspaceId);
+            
+            await setDoc(workspaceRef, {
+              tasks,
+              updatedAt: serverTimestamp(),
+              updatedBy: userId
+            }, { merge: true });
+
+          } catch (error) {
+            console.error('Failed to sync to Firebase:', error);
+          }
+        }, 300);
+
+        return () => {
+          if (syncTimeout.current) clearTimeout(syncTimeout.current);
+        };
+      }, [tasks, workspaceId, userId, isConnected]);
+
+      useEffect(() => {
+        if (!isConnected) {
+          loadFromStorage();
+        }
+      }, [isConnected]);
+
+      useEffect(() => {
+        if (tasks.length >= 0) {
+          const timer = setTimeout(() => {
+            try {
+              localStorage.setItem('tasks-data', JSON.stringify({
+                tasks,
+                expandedTasks: Array.from(expandedTasks)
+              }));
+            } catch (error) {
+              console.error('Failed to save:', error);
+            }
+          }, 500);
+          return () => clearTimeout(timer);
+        }
+      }, [tasks, expandedTasks]);
+
+      const addToHistory = (newTasks) => {
+        const newHistory = history.slice(0, historyIndex + 1);
+        newHistory.push(JSON.parse(JSON.stringify(newTasks)));
+        if (newHistory.length > 50) newHistory.shift();
+        setHistory(newHistory);
+        setHistoryIndex(newHistory.length - 1);
+      };
+
+      const updateTasks = (newTasks) => {
+        addToHistory(newTasks);
+        setTasks(newTasks);
+      };
+
+      const undo = () => {
+        if (historyIndex > 0) {
+          setHistoryIndex(historyIndex - 1);
+          setTasks(JSON.parse(JSON.stringify(history[historyIndex - 1])));
+        }
+      };
+
+      const redo = () => {
+        if (historyIndex < history.length - 1) {
+          setHistoryIndex(historyIndex + 1);
+          setTasks(JSON.parse(JSON.stringify(history[historyIndex + 1])));
+        }
+      };
+
+      const addTask = (parentId = null) => {
+        if (input.trim()) {
+          const newTask = {
+            id: Date.now(),
+            text: input,
+            completed: false,
+            parentId,
+            children: [],
+            dueDate: null,
+            tags: [],
+            createdAt: new Date().toISOString()
+          };
+
+          if (parentId === null) {
+            updateTasks([...tasks, newTask]);
+          } else {
+            updateTasks(addSubtask(tasks, parentId, newTask));
+            setExpandedTasks(new Set([...expandedTasks, parentId]));
+          }
+          setInput('');
+        }
+      };
+
+      const addSubtask = (taskList, parentId, newTask) => {
+        return taskList.map(task => {
+          if (task.id === parentId) {
+            return { ...task, children: [...task.children, newTask] };
+          }
+          if (task.children.length > 0) {
+            return { ...task, children: addSubtask(task.children, parentId, newTask) };
+          }
+          return task;
+        });
+      };
+
+      const findAndRemoveTask = (taskList, taskId) => {
+        let removedTask = null;
+        
+        const remove = (list) => {
+          for (let i = 0; i < list.length; i++) {
+            if (list[i].id === taskId) {
+              removedTask = { ...list[i] };
+              return [...list.slice(0, i), ...list.slice(i + 1)];
+            }
+            if (list[i].children.length > 0) {
+              const newChildren = remove(list[i].children);
+              if (removedTask) {
+                return list.map(t => t.id === list[i].id ? { ...t, children: newChildren } : t);
+              }
+            }
+          }
+          return list;
+        };
+        
+        return { updatedTasks: remove(taskList), removedTask };
+      };
+
+      const toggleTask = (id) => {
+        const newTasks = toggleTaskRecursive(tasks, id);
+        const withAutoComplete = autoCompleteParents(newTasks);
+        updateTasks(withAutoComplete);
+      };
+
+      const toggleTaskRecursive = (taskList, id) => {
+        return taskList.map(task => {
+          if (task.id === id) {
+            return { ...task, completed: !task.completed };
+          }
+          if (task.children.length > 0) {
+            return { ...task, children: toggleTaskRecursive(task.children, id) };
+          }
+          return task;
+        });
+      };
+
+      const autoCompleteParents = (taskList) => {
+        return taskList.map(task => {
+          if (task.children.length > 0) {
+            const updatedChildren = autoCompleteParents(task.children);
+            const allChildrenComplete = updatedChildren.every(child => child.completed);
+            return { 
+              ...task, 
+              children: updatedChildren,
+              completed: allChildrenComplete
+            };
+          }
+          return task;
+        });
+      };
+
+      const deleteTask = (id) => {
+        updateTasks(deleteTaskRecursive(tasks, id));
+        setSelectedTasks(prev => {
+          const newSet = new Set(prev);
+          newSet.delete(id);
+          return newSet;
+        });
+      };
+
+      const deleteTaskRecursive = (taskList, id) => {
+        return taskList
+          .filter(task => task.id !== id)
+          .map(task => ({
+            ...task,
+            children: deleteTaskRecursive(task.children, id)
+          }));
+      };
+
+      const editTaskText = (taskId, newText) => {
+        const edit = (taskList) => {
+          return taskList.map(task => {
+            if (task.id === taskId) {
+              return { ...task, text: newText };
+            }
+            if (task.children.length > 0) {
+              return { ...task, children: edit(task.children) };
+            }
+            return task;
+          });
+        };
+        updateTasks(edit(tasks));
+      };
+
+      const updateTaskDueDate = (taskId, dueDate) => {
+        const update = (taskList) => {
+          return taskList.map(task => {
+            if (task.id === taskId) {
+              return { ...task, dueDate };
+            }
+            if (task.children.length > 0) {
+              return { ...task, children: update(task.children) };
+            }
+            return task;
+          });
+        };
+        updateTasks(update(tasks));
+      };
+
+      const addTagToTask = (taskId, tag) => {
+        const update = (taskList) => {
+          return taskList.map(task => {
+            if (task.id === taskId) {
+              const tags = task.tags || [];
+              if (!tags.includes(tag)) {
+                return { ...task, tags: [...tags, tag] };
+              }
+            }
+            if (task.children.length > 0) {
+              return { ...task, children: update(task.children) };
+            }
+            return task;
+          });
+        };
+        updateTasks(update(tasks));
+      };
+
+      const removeTagFromTask = (taskId, tag) => {
+        const update = (taskList) => {
+          return taskList.map(task => {
+            if (task.id === taskId) {
+              return { ...task, tags: (task.tags || []).filter(t => t !== tag) };
+            }
+            if (task.children.length > 0) {
+              return { ...task, children: update(task.children) };
+            }
+            return task;
+          });
+        };
+        updateTasks(update(tasks));
+      };
+
+      const duplicateTask = (taskId) => {
+        const findTask = (taskList, id) => {
+          for (const task of taskList) {
+            if (task.id === id) return task;
+            if (task.children.length > 0) {
+              const found = findTask(task.children, id);
+              if (found) return found;
+            }
+          }
+          return null;
+        };
+
+        const task = findTask(tasks, taskId);
+        if (task) {
+          const duplicated = {
+            ...task,
+            id: Date.now(),
+            text: `${task.text} (copy)`,
+            completed: false,
+            children: task.children.map((child, idx) => ({
+              ...child,
+              id: Date.now() + idx + 1,
+              completed: false
+            }))
+          };
+
+          if (task.parentId === null) {
+            updateTasks([...tasks, duplicated]);
+          } else {
+            updateTasks(addSubtask(tasks, task.parentId, duplicated));
+          }
+        }
+      };
+
+      const toggleExpand = (id) => {
+        const newExpanded = new Set(expandedTasks);
+        if (newExpanded.has(id)) {
+          newExpanded.delete(id);
+        } else {
+          newExpanded.add(id);
+        }
+        setExpandedTasks(newExpanded);
+      };
+
+      const handleKeyPress = (e) => {
+        if (e.key === 'Enter') {
+          addTask();
+        }
+      };
+
+      const countTasks = (taskList) => {
+        let total = 0;
+        let completed = 0;
+        
+        const count = (tasks) => {
+          tasks.forEach(task => {
+            total++;
+            if (task.completed) completed++;
+            if (task.children.length > 0) count(task.children);
+          });
+        };
+        
+        count(taskList);
+        return { total, completed };
+      };
+
+      const handleDragStart = (e, task, parentId) => {
+        setDraggedTask({ task, parentId });
+        e.dataTransfer.effectAllowed = 'move';
+      };
+
+      const handleDragOver = (e, isRoot = false) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setDragOverTarget(isRoot ? 'root' : null);
+      };
+
+      const handleDragOverTask = (e, task, parentId) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setDragOverTarget({ taskId: task.id, parentId });
+      };
+
+      const handleDrop = (e, targetTask = null, targetParentId = null) => {
+        e.preventDefault();
+        e.stopPropagation();
+        
+        if (!draggedTask) {
+          setDragOverTarget(null);
+          return;
+        }
+
+        if (targetTask === null) {
+          const { updatedTasks, removedTask } = findAndRemoveTask(tasks, draggedTask.task.id);
+          
+          if (removedTask) {
+            const newRootTask = {
+              ...removedTask,
+              parentId: null
+            };
+            
+            updateTasks([...updatedTasks, newRootTask]);
+          }
+          
+          setDraggedTask(null);
+          setDragOverTarget(null);
+          return;
+        }
+
+        if (draggedTask.task.id === targetTask.id) {
+          setDraggedTask(null);
+          setDragOverTarget(null);
+          return;
+        }
+
+        const isDescendant = (task, targetId) => {
+          if (task.id === targetId) return true;
+          return task.children.some(child => isDescendant(child, targetId));
+        };
+
+        if (isDescendant(draggedTask.task, targetTask.id)) {
+          setDraggedTask(null);
+          setDragOverTarget(null);
+          return;
+        }
+
+        if (draggedTask.parentId === targetParentId) {
+          const parentList = targetParentId === null ? tasks : 
+            findTaskChildren(tasks, targetParentId);
+          
+          const dragIndex = parentList.findIndex(t => t.id === draggedTask.task.id);
+          const targetIndex = parentList.findIndex(t => t.id === targetTask.id);
+          
+          if (dragIndex !== -1 && targetIndex !== -1) {
+            const reordered = [...parentList];
+            const [removed] = reordered.splice(dragIndex, 1);
+            reordered.splice(targetIndex, 0, removed);
+            
+            if (targetParentId === null) {
+              updateTasks(reordered);
+            } else {
+              updateTasks(replaceTaskChildren(tasks, targetParentId, reordered));
+            }
+          }
+        } else {
+          const { updatedTasks, removedTask } = findAndRemoveTask(tasks, draggedTask.task.id);
+          if (removedTask) {
+            const newSubtask = {
+              ...removedTask,
+              parentId: targetTask.id
+            };
+            updateTasks(addSubtask(updatedTasks, targetTask.id, newSubtask));
+            setExpandedTasks(new Set([...expandedTasks, targetTask.id]));
+          }
+        }
+
+        setDraggedTask(null);
+        setDragOverTarget(null);
+      };
+
+      const findTaskChildren = (taskList, parentId) => {
+        for (const task of taskList) {
+          if (task.id === parentId) {
+            return task.children;
+          }
+          if (task.children.length > 0) {
+            const found = findTaskChildren(task.children, parentId);
+            if (found) return found;
+          }
+        }
+        return [];
+      };
+
+      const replaceTaskChildren = (taskList, parentId, newChildren) => {
+        return taskList.map(task => {
+          if (task.id === parentId) {
+            return { ...task, children: newChildren };
+          }
+          if (task.children.length > 0) {
+            return { ...task, children: replaceTaskChildren(task.children, parentId, newChildren) };
+          }
+          return task;
+        });
+      };
+
+      const toggleTaskSelection = (taskId) => {
+        setSelectedTasks(prev => {
+          const newSet = new Set(prev);
+          if (newSet.has(taskId)) {
+            newSet.delete(taskId);
+          } else {
+            newSet.add(taskId);
+          }
+          return newSet;
+        });
+      };
+
+      const bulkComplete = () => {
+        const update = (taskList) => {
+          return taskList.map(task => {
+            if (selectedTasks.has(task.id)) {
+              return { ...task, completed: true };
+            }
+            if (task.children.length > 0) {
+              return { ...task, children: update(task.children) };
+            }
+            return task;
+          });
+        };
+        updateTasks(update(tasks));
+        setSelectedTasks(new Set());
+      };
+
+      const bulkDelete = () => {
+        const deleteMultiple = (taskList) => {
+          return taskList
+            .filter(task => !selectedTasks.has(task.id))
+            .map(task => ({
+              ...task,
+              children: deleteMultiple(task.children)
+            }));
+        };
+        updateTasks(deleteMultiple(tasks));
+        setSelectedTasks(new Set());
+      };
+
+      const exportTasks = () => {
+        const dataStr = JSON.stringify(tasks, null, 2);
+        const dataBlob = new Blob([dataStr], { type: 'application/json' });
+        const url = URL.createObjectURL(dataBlob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `tasks_${new Date().toISOString().split('T')[0]}.json`;
+        link.click();
+        URL.revokeObjectURL(url);
+      };
+
+      const importTasks = (e) => {
+        const file = e.target.files[0];
+        if (file) {
+          const reader = new FileReader();
+          reader.onload = (event) => {
+            try {
+              const importedTasks = JSON.parse(event.target.result);
+              updateTasks(importedTasks);
+            } catch (error) {
+              alert('Failed to import tasks. Please check the file format.');
+            }
+          };
+          reader.readAsText(file);
+        }
+      };
+
+      const filterTasks = (taskList) => {
+        if (showCompletedOnly) {
+          return getAllCompletedTasks(taskList);
+        }
+        
+        return taskList.filter(task => {
+          const matchesSearch = task.text.toLowerCase().includes(searchQuery.toLowerCase());
+          const matchesStatus = 
+            filterStatus === 'all' || 
+            (filterStatus === 'completed' && task.completed) ||
+            (filterStatus === 'active' && !task.completed) ||
+            (filterStatus === 'overdue' && task.dueDate && new Date(task.dueDate) < new Date() && !task.completed);
+          
+          return matchesSearch && matchesStatus;
+        }).map(task => ({
+          ...task,
+          children: filterTasks(task.children)
+        }));
+      };
+
+      const getAllCompletedTasks = (taskList) => {
+        let completed = [];
+        
+        const collect = (tasks) => {
+          tasks.forEach(task => {
+            if (task.completed) {
+              completed.push({ ...task, children: [] });
+            }
+            if (task.children.length > 0) {
+              collect(task.children);
+            }
+          });
+        };
+        
+        collect(taskList);
+        return completed;
+      };
+
+      const filteredTasks = filterTasks(tasks);
+
+      const WorkspaceModal = () => {
+        const [inputWorkspaceId, setInputWorkspaceId] = useState(workspaceId);
+        const [inputUserName, setInputUserName] = useState(userName);
+
+        const handleJoin = () => {
+          setWorkspaceId(inputWorkspaceId);
+          setUserName(inputUserName);
+          setShowWorkspaceModal(false);
+        };
+
+        return (
+          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+            <div className="bg-white rounded-lg p-6 max-w-md w-full mx-4">
+              <h2 className="text-2xl font-bold mb-4">Join Workspace</h2>
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    Your Name
+                  </label>
+                  <input
+                    type="text"
+                    value={inputUserName}
+                    onChange={(e) => setInputUserName(e.target.value)}
+                    placeholder="Enter your name"
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    Workspace ID
+                  </label>
+                  <input
+                    type="text"
+                    value={inputWorkspaceId}
+                    onChange={(e) => setInputWorkspaceId(e.target.value)}
+                    placeholder="default-workspace"
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                  <p className="text-xs text-gray-500 mt-1">
+                    Share this ID with teammates to collaborate
+                  </p>
+                </div>
+                <button
+                  onClick={handleJoin}
+                  disabled={!inputUserName.trim() || !inputWorkspaceId.trim()}
+                  className="w-full bg-blue-500 hover:bg-blue-600 disabled:bg-gray-300 text-white px-4 py-2 rounded-lg transition-colors"
+                >
+                  Join Workspace
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      };
+
+      const TaskItem = ({ task, level = 0, parentId = null }) => {
+        const [showSubtaskInput, setShowSubtaskInput] = useState(false);
+        const [subtaskInput, setSubtaskInput] = useState('');
+        const [editingText, setEditingText] = useState(false);
+        const [tempText, setTempText] = useState(task.text);
+        const [showDatePicker, setShowDatePicker] = useState(false);
+        const [showTagInput, setShowTagInput] = useState(false);
+        const [tagInput, setTagInput] = useState('');
+        
+        const hasChildren = task.children.length > 0;
+        const isExpanded = expandedTasks.has(task.id);
+        const isDraggedOver = dragOverTarget?.taskId === task.id;
+        const isSelected = selectedTasks.has(task.id);
+        const isOverdue = task.dueDate && new Date(task.dueDate) < new Date() && !task.completed;
+
+        const getSubtaskProgress = () => {
+          if (task.children.length === 0) return null;
+          const completed = task.children.filter(c => c.completed).length;
+          const total = task.children.length;
+          return { completed, total, percentage: Math.round((completed / total) * 100) };
+        };
+
+        const getNestedTaskCount = () => {
+          let count = 0;
+          const countNested = (tasks) => {
+            tasks.forEach(t => {
+              count++;
+              if (t.children.length > 0) {
+                countNested(t.children);
+              }
+            });
+          };
+          if (task.children.length > 0) {
+            countNested(task.children);
+          }
+          return count;
+        };
+
+        const progress = getSubtaskProgress();
+        const nestedCount = getNestedTaskCount();
+
+        const addSubtaskToThis = () => {
+          if (subtaskInput.trim()) {
+            const newTask = {
+              id: Date.now(),
+              text: subtaskInput,
+              completed: false,
+              parentId: task.id,
+              children: [],
+              dueDate: null,
+              tags: [],
+              createdAt: new Date().toISOString()
+            };
+            updateTasks(addSubtask(tasks, task.id, newTask));
+            setSubtaskInput('');
+            setShowSubtaskInput(false);
+            setExpandedTasks(new Set([...expandedTasks, task.id]));
+          }
+        };
+
+        return React.createElement('div', { className: 'mb-1' },
+          React.createElement('div', {
+            draggable: true,
+            onDragStart: (e) => handleDragStart(e, task, parentId),
+            onDragOver: (e) => handleDragOverTask(e, task, parentId),
+            onDrop: (e) => handleDrop(e, task, parentId),
+            className: `flex items-center gap-2 p-3 rounded-lg transition-all ${
+              isDraggedOver ? 'bg-blue-200 ring-2 ring-blue-400' : 
+              isSelected ? 'bg-blue-50 ring-2 ring-blue-300' :
+              isOverdue ? 'bg-red-50 hover:bg-red-100' :
+              'bg-gray-50 hover:bg-gray-100'
+            }`,
+            style: { marginLeft: `${level * 24}px` }
+          },
+            showBulkActions && React.createElement('input', {
+              type: 'checkbox',
+              checked: isSelected,
+              onChange: () => toggleTaskSelection(task.id),
+              className: 'w-4 h-4 cursor-pointer'
+            }),
+            React.createElement(GripVertical, { size: 18, className:
